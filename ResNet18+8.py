@@ -19,6 +19,10 @@ from transformers import BertModel, BertTokenizer
 from PIL import Image
 import torch.cuda as cuda
 
+import nltk
+from nltk.sentiment import SentimentIntensityAnalyzer
+
+
 # ===================== 配置参数 =====================
 class Config:
     # 数据配置 (修改这些路径以匹配您的数据位置)
@@ -28,15 +32,16 @@ class Config:
     
     # 模型配置
     TEXT_MAX_LENGTH = 128                               # 文本最大长度
-    TEXT_FEAT_DIM = 256                                 # 文本特征维度 (128 * 2)
-    IMG_FEAT_DIM = 512                                  # 图像特征维度
-    FUSION_DIM = 128                                    # 融合特征维度
+    TEXT_FEAT_DIM = 128                                 # 文本特征维度
+    IMG_FEAT_DIM = 256                                  # 图像特征维度
+    FUSION_DIM = 124                                    # 图文融合特征维度
+    FINAL_DIM = 128                                     # 最终融合特征维度
     DROPOUT_RATE = 0.5                                  # Dropout率
     MAX_IMAGES_PER_POST = 5                             # 每个帖子最多处理的图像数量
     
     # 训练配置
     BATCH_SIZE = 8 if cuda.is_available() and cuda.get_device_properties(0).total_memory < 8e9 else 16
-    EPOCHS = 30                                         # 训练轮数
+    EPOCHS = 50                                         # 训练轮数
     LEARNING_RATE = 1e-4                                # 学习率
     
     # 数据集划分
@@ -65,6 +70,60 @@ class Config:
         os.makedirs(Config.LOG_DIR, exist_ok=True)
         os.makedirs(Config.RESULTS_DIR, exist_ok=True)
 
+# ===================== NLTK资源处理 =====================
+def setup_nltk():
+    """设置NLTK资源路径，优先使用本地缓存"""
+    try:
+        # 尝试设置本地缓存路径
+        nltk_data_path = os.path.join(os.path.expanduser("~"), "nltk_data")
+        if os.path.exists(nltk_data_path):
+            nltk.data.path.append(nltk_data_path)
+            print(f"使用本地NLTK资源: {nltk_data_path}")
+        
+        # 检查是否已下载vader_lexicon
+        nltk.data.find("sentiment/vader_lexicon.zip")
+        print("NLTK资源已存在")
+    except LookupError:
+        print("下载NLTK资源...")
+        try:
+            nltk.download('vader_lexicon', quiet=True)
+            print("NLTK资源下载成功")
+        except Exception as e:
+            print(f"无法下载NLTK资源: {e}")
+            print("请手动下载vader_lexicon.zip并放置在nltk_data/sentiment目录下")
+            print("或者使用以下命令: python -m nltk.downloader vader_lexicon")
+            
+# 初始化情感分析器
+try:
+    sia = SentimentIntensityAnalyzer()
+    print("情感分析器初始化成功")
+except Exception as e:
+    print(f"情感分析器初始化失败: {e}")
+    sia = None
+
+def analyze_sentiment(text):
+    """
+    使用NLTK的VADER进行情感分析
+    
+    返回包含四个情感维度的字典:
+    - 'neg': 负面情感强度 (0.0-1.0)
+    - 'neu': 中性情感强度 (0.0-1.0)
+    - 'pos': 正面情感强度 (0.0-1.0)
+    - 'compound': 综合情感分数 (-1.0到1.0)
+    """
+    if not sia:
+        # 情感分析器不可用，返回默认值
+        return {'neg': 0.0, 'neu': 1.0, 'pos': 0.0, 'compound': 0.0}
+    
+    if not isinstance(text, str) or len(text.strip()) == 0:
+        return {'neg': 0.0, 'neu': 1.0, 'pos': 0.0, 'compound': 0.0}
+    
+    try:
+        return sia.polarity_scores(text)
+    except Exception as e:
+        print(f"情感分析出错: {e}")
+        return {'neg': 0.0, 'neu': 1.0, 'pos': 0.0, 'compound': 0.0}
+
 # ===================== 数据处理函数 =====================
 def find_image_file(image_id):
     """查找图像文件（支持多种扩展名）"""
@@ -90,8 +149,8 @@ def load_and_process_data():
     print(f"成功加载 {len(df)} 条记录")
     print("预处理数据...")
     
-    # 清理文本
-    df['cleaned_text'] = df['post_text'].apply(preprocess_text)
+    # 清理文本并添加情感特征
+    df['text_data'] = df['post_text'].apply(preprocess_text)
     
     # 处理图像ID
     df['image_ids'] = df['image_id(s)'].apply(
@@ -128,26 +187,49 @@ def load_and_process_data():
     test_df = df[df['post_id'].isin(test_ids)]
     
     print(f"训练集: {len(train_df)} 条 ({len(train_df)/len(df)*100:.1f}%)")
-    print(f"验证集: {len(val_df)} 条 ({len(val_df)/len(df)*100:.1f}%)")
+    print(f"验证极: {len(val_df)} 条 ({len(val_df)/len(df)*100:.1f}%)")
     print(f"测试集: {len(test_df)} 条 ({len(test_df)/len(df)*100:.1f}%)")
     
     return train_df, val_df, test_df
 
 def preprocess_text(text):
-    """清理文本数据"""
+    """
+    清理文本数据并添加情感特征
+    
+    返回包含以下内容的字典:
+    - 'cleaned_text': 清理后的文本
+    - 'sentiment_neg': 负面情感强度 (0.0-1.0)
+    - 'sentiment_neu': 中性情感强度 (0.0-1.0)
+    - 'sentiment_pos': 正面情感强度 (0.0-1.0)
+    - 'sentiment_compound': 综合情感分数 (-1.0到1.0)
+    """
     if not isinstance(text, str):
-        return ""
+        return {
+            'cleaned_text': "",
+            'sentiment_neg': 0.0,
+            'sentiment_neu': 1.0,
+            'sentiment_pos': 0.0,
+            'sentiment_compound': 0.0
+        }
     
-    # 移除URL
-    text = re.sub(r'http\S+', '', text)
-    # 移除用户提及
-    text = re.sub(r'@\w+', '', text)
-    # 移除特殊字符
-    text = re.sub(r'[^\w\s]', '', text)
-    # 替换多个空格
-    text = re.sub(r'\s+', ' ', text)
+    # 基础文本清理
+    text = re.sub(r'http\S+', '', text)  # 移除URL
+    text = re.sub(r'@\w+', '', text)      # 移除用户提及
+    text = re.sub(r'[^\w\s]', '', text)   # 移除特殊字符
+    text = re.sub(r'\s+', ' ', text)      # 替换多个空格
     
-    return text.strip()
+    cleaned_text = text.strip()
+    
+    # 情感分析
+    sentiment = analyze_sentiment(cleaned_text)
+    
+    return {
+        'cleaned_text': cleaned_text,
+        'sentiment_neg': sentiment['neg'],
+        'sentiment_neu': sentiment['neu'],
+        'sentiment_pos': sentiment['pos'],
+        'sentiment_compound': sentiment['compound']
+    }
 
 # ===================== 数据集类 =====================
 class MultimodalRumorDataset(Dataset):
@@ -173,13 +255,27 @@ class MultimodalRumorDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
-        # 文本处理
-        text = row['cleaned_text']
+        # 获取预处理结果
+        text_data = row['text_data']
+        if isinstance(text_data, dict):
+            cleaned_text = text_data['cleaned_text']
+            sentiment_features = [
+                text_data['sentiment_neg'],
+                text_data['sentiment_neu'],
+                text_data['sentiment_pos'],
+                text_data['sentiment_compound']
+            ]
+        else:
+            cleaned_text = text_data
+            sentiment_features = [0.0, 1.0, 0.0, 0.0]  # 默认中性情感
+        
+        # 将情感特征转换为张量
+        sentiment_tensor = torch.tensor(sentiment_features, dtype=torch.float)
         
         # Tokenize文本（如果有分词器）
         if self.tokenizer:
             tokenized = self.tokenizer(
-                text,
+                cleaned_text,
                 padding='max_length',
                 max_length=Config.TEXT_MAX_LENGTH,
                 truncation=True,
@@ -231,6 +327,7 @@ class MultimodalRumorDataset(Dataset):
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'images': images,  # 形状为 [MAX_IMAGES_PER_POST, 3, H, W]
+            'sentiment': sentiment_tensor,  # 情感特征张量
             'label': torch.tensor(label, dtype=torch.long)
         }
 
@@ -263,9 +360,9 @@ class MultimodalRumorDetector(nn.Module):
             bidirectional=True
         )
         
-        # 文本特征处理层
+        # 文本特征处理层 (降维到128维)
         self.text_fc = nn.Sequential(
-            nn.Linear(256, Config.FUSION_DIM),
+            nn.Linear(256, Config.TEXT_FEAT_DIM),
             nn.ReLU(),
             nn.Dropout(Config.DROPOUT_RATE)
         )
@@ -275,30 +372,34 @@ class MultimodalRumorDetector(nn.Module):
         # 移除最后的分类层
         self.resnet.fc = nn.Identity()
         
-        # 图像特征处理层
+        # 图像特征处理层 (降维到256维)
         self.img_fc = nn.Sequential(
             nn.Linear(512, Config.IMG_FEAT_DIM),
             nn.ReLU(),
             nn.Dropout(Config.DROPOUT_RATE)
         )
         
-        # 全局平均池化
-        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # 多模态融合
-        self.fusion = nn.Sequential(
-            nn.Linear(Config.FUSION_DIM + Config.IMG_FEAT_DIM, Config.FUSION_DIM),
+        # 图文融合层 (128 + 256 = 384 → 124维)
+        self.fusion_fc = nn.Sequential(
+            nn.Linear(Config.TEXT_FEAT_DIM + Config.IMG_FEAT_DIM, Config.FUSION_DIM),
             nn.ReLU(),
             nn.Dropout(Config.DROPOUT_RATE)
         )
         
-        # 分类层
+        # 最终特征融合层 (124维图文融合特征 + 4维情感特征 = 128维)
+        self.final_fusion = nn.Sequential(
+            nn.Linear(Config.FUSION_DIM + 4, Config.FINAL_DIM),
+            nn.ReLU(),
+            nn.Dropout(Config.DROPOUT_RATE)
+        )
+        
+        # 分类层 (128维输入 → 2类输出)
         self.classifier = nn.Sequential(
-            nn.Linear(Config.FUSION_DIM, 2),
+            nn.Linear(Config.FINAL_DIM, 2),
             nn.Softmax(dim=1)
         )
 
-    def forward(self, input_ids, attention_mask, images):
+    def forward(self, input_ids, attention_mask, images, sentiment):
         """
         前向传播
         
@@ -306,6 +407,7 @@ class MultimodalRumorDetector(nn.Module):
         - input_ids: BERT输入token IDs [batch_size, seq_len]
         - attention_mask: BERT注意力掩码 [batch_size, seq_len]
         - images: 输入图像 [batch_size, MAX_IMAGES_PER_POST, 3, 224, 224]
+        - sentiment: 情感特征 [batch_size, 4]
         
         输出:
         - 分类概率 [batch_size, 2]
@@ -335,7 +437,7 @@ class MultimodalRumorDetector(nn.Module):
         
         # 获取BiLSTM的最后隐藏状态（前向和后向拼接）
         text_features = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
-        text_features = self.text_fc(text_features)
+        text_features = self.text_fc(text_features)  # [batch_size, TEXT_FEAT_DIM]
         
         # === 图像特征提取 ===
         # 重塑图像张量: [batch_size * MAX_IMAGES_PER_POST, 3, H, W]
@@ -343,20 +445,30 @@ class MultimodalRumorDetector(nn.Module):
         
         # 提取图像特征
         img_features = self.resnet(images)
-        img_features = self.img_fc(img_features)
+        img_features = self.img_fc(img_features)  # [batch_size*MAX_IMAGES_PER_POST, IMG_FEAT_DIM]
         
         # 重塑回原始形状: [batch_size, MAX_IMAGES_PER_POST, IMG_FEAT_DIM]
         img_features = img_features.view(batch_size, Config.MAX_IMAGES_PER_POST, -1)
         
         # 对每个帖子的多张图像取平均特征
-        img_features = torch.mean(img_features, dim=1)
+        img_features = torch.mean(img_features, dim=1)  # [batch_size, IMG_FEAT_DIM]
         
-        # === 多模态融合 ===
-        fused = torch.cat([text_features, img_features], dim=1)
-        fused = self.fusion(fused)
+        # === 文本+图像融合 ===
+        # 拼接文本和图像特征
+        text_img_fused = torch.cat([text_features, img_features], dim=1)  # [batch_size, TEXT_FEAT_DIM + IMG_FEAT_DIM]
+        
+        # 降维到124维
+        fused_features = self.fusion_fc(text_img_fused)  # [batch_size, FUSION_DIM]
+        
+        # === 情感特征融合 ===
+        # 与情感特征拼接 (124 + 4 = 128维)
+        final_features = torch.cat([fused_features, sentiment], dim=1)  # [batch_size, FUSION_DIM + 4]
+        
+        # 最终融合处理
+        final_features = self.final_fusion(final_features)  # [batch_size, FINAL_DIM]
         
         # === 分类 ===
-        return self.classifier(fused)
+        return self.classifier(final_features)
 
 # ===================== 训练函数 =====================
 def train_model(model, train_loader, val_loader, device):
@@ -396,10 +508,11 @@ def train_model(model, train_loader, val_loader, device):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             images = batch['images'].to(device)
+            sentiment = batch['sentiment'].to(device)  # 情感特征
             labels = batch['label'].to(device)
             
             # 前向传播
-            outputs = model(input_ids, attention_mask, images)
+            outputs = model(input_ids, attention_mask, images, sentiment)
             loss = criterion(outputs, labels)
             
             # 反向传播
@@ -471,10 +584,11 @@ def validate_model(model, data_loader, criterion, device):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             images = batch['images'].to(device)
+            sentiment = batch['sentiment'].to(device)  # 情感特征
             labels = batch['label'].to(device)
             
             # 前向传播
-            outputs = model(input_ids, attention_mask, images)
+            outputs = model(input_ids, attention_mask, images, sentiment)
             loss = criterion(outputs, labels)
             
             # 统计
@@ -514,10 +628,11 @@ def evaluate_model(model, test_loader, device):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             images = batch['images'].to(device)
+            sentiment = batch['sentiment'].to(device)  # 情感特征
             labels = batch['label'].to(device)
             
             # 前向传播
-            outputs = model(input_ids, attention_mask, images)
+            outputs = model(input_ids, attention_mask, images, sentiment)
             probs, preds = torch.max(outputs, 1)
             
             # 收集结果
@@ -545,9 +660,9 @@ def evaluate_model(model, test_loader, device):
     
     # 保存评估指标
     with open(metrics_file, 'w') as f:
-        f.write("multimodal rumor detection results\n")
+        f.write("MultimodalRumorDetector Evaluation Metrics\n\n")
         f.write("==============================\n\n")
-        f.write(f"dataset size: {len(all_labels)}\n")
+        f.write(f"data size: {len(all_labels)}\n")
         f.write(f"accuracy: {accuracy:.4f}\n\n")
         f.write("confusion matrix:\n")
         f.write(np.array2string(conf_matrix))
@@ -557,15 +672,15 @@ def evaluate_model(model, test_loader, device):
     # 绘制混淆矩阵
     plt.figure(figsize=(8, 6))
     sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=['real', 'fake'], 
-                yticklabels=['real', 'fake'])
-    plt.xlabel('predicted label')
-    plt.ylabel('true label')
-    plt.title('confusion matrix')
+                xticklabels=['True', 'False'], 
+                yticklabels=['True', 'False'])
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.title('Confusion Matrix')
     plt.savefig(confusion_file)
     plt.close()
     
-    print(f"评估结果已保存到 {Config.RESULTS_DIR}")
+    print(f"Evaluation results saved to {Config.RESULTS_DIR}")
     
     # 返回准确率
     return accuracy
@@ -577,19 +692,19 @@ def plot_training_history(history):
     
     # 损失图
     plt.subplot(2, 1, 1)
-    plt.plot(history['train_loss'], label='training loss')
-    plt.plot(history['val_loss'], label='validation loss')
+    plt.plot(history['train_loss'], label='Training Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
     plt.title('Training and Validation Loss')
-    plt.xlabel('Epoch')
+    plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.legend()
     
     # 准确率图
     plt.subplot(2, 1, 2)
-    plt.plot(history['train_acc'], label='Train_Acc')
-    plt.plot(history['val_acc'], label='Val_Acc')
+    plt.plot(history['train_acc'], label='Training Accuracy')
+    plt.plot(history['val_acc'], label='Validation Accuracy')
     plt.title('Training and Validation Accuracy')
-    plt.xlabel('Epoch')
+    plt.xlabel('Epochs')
     plt.ylabel('Accuracy')
     plt.legend()
     
@@ -598,10 +713,13 @@ def plot_training_history(history):
     plt.tight_layout()
     plt.savefig(plot_path)
     plt.close()
-    print(f"训练历史图表已保存到: {plot_path}")
+    print(f"Training history plot saved to: {plot_path}")
 
 # ===================== 主函数 =====================
 def main():
+    # 设置NLTK资源
+    setup_nltk()
+    
     # 设置输出目录
     Config.setup_directories()
     
@@ -677,6 +795,6 @@ if __name__ == "__main__":
         import subprocess
         subprocess.run(["pip", "install", "torch", "torchvision", "transformers", 
                         "pandas", "numpy", "matplotlib", "seaborn", "scikit-learn", 
-                        "tqdm", "Pillow"])
+                        "tqdm", "Pillow", "nltk"])
     
     main()
